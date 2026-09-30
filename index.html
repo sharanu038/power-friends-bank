@@ -643,6 +643,7 @@
     months: [],
     ledgers: {},
     loanRequests: [],
+    loanRequestLog: [],
     currentMonth: null,
     viewingMonth: null,
     view: 'dashboard'
@@ -722,6 +723,36 @@
   async function persistLedger(monthKey){ await save('fb:ledger:' + monthKey, state.ledgers[monthKey]); }
   async function deleteLedgerStorage(monthKey){ await remove('fb:ledger:' + monthKey); }
   async function persistLoanRequests(){ await save('fb:loanRequests', state.loanRequests); }
+  async function persistLoanRequestLog(){ await save('fb:loanRequestLog', state.loanRequestLog); }
+
+  // Who is performing this action right now — the logged-in member's own record if we can
+  // resolve it, otherwise the raw login name, otherwise a generic fallback. Used so the
+  // loan request log can show exactly who created or cancelled a request.
+  function currentActorName(){
+    const lm = findLoggedInLiveMember();
+    if(lm) return lm.name;
+    if(window.__loggedInMemberName) return window.__loggedInMemberName;
+    return window.isAdmin ? 'Admin' : 'Unknown user';
+  }
+
+  // Appends an entry to the shared loan-request log. Logging is best-effort: if it fails
+  // (e.g. a rules problem on the log document), the underlying request action has already
+  // succeeded and must not be undone or blocked because of it.
+  async function appendLoanRequestLog(action, req){
+    try{
+      state.loanRequestLog.push({
+        id: uid(),
+        action,                        // 'created' | 'cancelled'
+        memberName: req.memberName,    // whose request this is
+        amount: req.amount,
+        byName: currentActorName(),    // who actually did it
+        timestamp: new Date().toISOString(),
+      });
+      await persistLoanRequestLog();
+    } catch(err){
+      console.error('appendLoanRequestLog failed:', err);
+    }
+  }
 
   function computeEntry(prevBalance, premium, rate, loanRefund, newLoan, carried, remark){
     prevBalance = rupee(prevBalance); loanRefund = rupee(loanRefund); newLoan = rupee(newLoan);
@@ -1011,6 +1042,7 @@
       state.months = [];
       state.ledgers = {};
       state.loanRequests = [];
+      state.loanRequestLog = [];
       state.currentMonth = '2026-07';
       ensureCurrentMonthLedger();
       preloadJuly2026();
@@ -1025,6 +1057,7 @@
     const meta = await load('fb:meta');
     const members = await load('fb:members');
     const loanRequests = await load('fb:loanRequests');
+    const loanRequestLog = await load('fb:loanRequestLog');
     const isFreshInstall = !meta && (!members || members.length === 0);
 
     if(meta){
@@ -1034,6 +1067,7 @@
     }
     state.members = members || [];
     state.loanRequests = loanRequests || [];
+    state.loanRequestLog = loanRequestLog || [];
 
     if(!state.currentMonth) state.currentMonth = isFreshInstall ? '2026-07' : thisMonthKey();
 
@@ -2307,7 +2341,7 @@
         if(!selectedMemberId){ msgP.style.display='block'; msgP.textContent='Select a member.'; return; }
         if(amt <= 0){ msgP.style.display='block'; msgP.textContent='Enter a valid amount.'; return; }
         const mem = state.members.find(x=>x.id===selectedMemberId);
-        state.loanRequests.push({
+        const newRequest = {
           id: uid(),
           memberId: selectedMemberId,
           memberName: mem ? mem.name : '',
@@ -2315,9 +2349,24 @@
           remark: remarkInp.value.trim(),
           requestedMonth: state.currentMonth,
           createdAt: new Date().toISOString(),
-        });
-        await persistLoanRequests();
-        render();
+        };
+        state.loanRequests.push(newRequest);
+        submitBtn.disabled = true;
+        try{
+          await persistLoanRequests();
+          await appendLoanRequestLog('created', newRequest);
+          render();
+        } catch(err){
+          // Roll back the in-memory add — otherwise the request would keep showing on
+          // THIS device for the rest of the session even though it was never actually
+          // saved, then vanish (looking like it "deleted itself") the next time the
+          // app reloads fresh data from Firestore.
+          state.loanRequests = state.loanRequests.filter(r => r.id !== newRequest.id);
+          submitBtn.disabled = false;
+          msgP.style.display = 'block';
+          msgP.textContent = "Couldn't save your request — you may not have permission to do this. Please tell the admin.";
+          console.error('persistLoanRequests failed:', err);
+        }
       };
       formBox.appendChild(submitBtn);
     }
@@ -2330,41 +2379,71 @@
       empty.style.cssText = 'text-align:center; color:var(--muted); padding:2rem 1rem; font-style:italic;';
       empty.textContent = 'No pending loan requests.';
       body.appendChild(empty);
-      return;
+    } else {
+      const sorted = [...state.loanRequests].sort((a,b)=> (b.createdAt||'').localeCompare(a.createdAt||''));
+      sorted.forEach(req=>{
+        const reqCard = document.createElement('div');
+        reqCard.style.cssText = 'background:var(--paper-2); backdrop-filter:var(--glass-filter); -webkit-backdrop-filter:var(--glass-filter); border:1px solid var(--rule); border-radius:var(--radius-lg); padding:14px 16px; margin-bottom:10px; box-shadow:var(--shadow-sm);';
+
+        const top = document.createElement('div');
+        top.style.cssText = 'display:flex; justify-content:space-between; align-items:baseline; gap:8px;';
+        top.innerHTML = `<span style="font-weight:700; color:var(--ink); font-size:14px;">${req.memberName}</span>
+          <span class="num" style="font-weight:800; color:var(--teal); font-size:15px;">${INR(req.amount)}</span>`;
+        reqCard.appendChild(top);
+
+        const metaP = document.createElement('p');
+        metaP.style.cssText = 'font-size:11.5px; color:var(--muted); margin:4px 0 0;';
+        metaP.textContent = `Requested ${monthLabel(req.requestedMonth)}${req.remark ? ' \u00B7 ' + req.remark : ''}`;
+        reqCard.appendChild(metaP);
+
+        const canCancel = window.isAdmin || (loggedInMember && loggedInMember.id === req.memberId);
+        if(canCancel){
+          const cancelBtn = document.createElement('button');
+          cancelBtn.className = 'ghost';
+          cancelBtn.style.cssText = 'margin-top:8px; color:var(--clay); padding:4px 8px; font-size:12px;';
+          cancelBtn.textContent = window.isAdmin ? 'Remove' : 'Cancel request';
+          cancelBtn.onclick = async ()=>{
+            const previous = state.loanRequests;
+            const removedReq = req;
+            state.loanRequests = state.loanRequests.filter(r=>r.id !== req.id);
+            try{
+              await persistLoanRequests();
+              await appendLoanRequestLog('cancelled', removedReq);
+              render();
+            } catch(err){
+              state.loanRequests = previous;
+              alert("Couldn't remove this request — you may not have permission to do this.");
+              console.error('persistLoanRequests failed:', err);
+            }
+          };
+          reqCard.appendChild(cancelBtn);
+        }
+
+        body.appendChild(reqCard);
+      });
     }
 
-    const sorted = [...state.loanRequests].sort((a,b)=> (b.createdAt||'').localeCompare(a.createdAt||''));
-    sorted.forEach(req=>{
-      const reqCard = document.createElement('div');
-      reqCard.style.cssText = 'background:var(--paper-2); backdrop-filter:var(--glass-filter); -webkit-backdrop-filter:var(--glass-filter); border:1px solid var(--rule); border-radius:var(--radius-lg); padding:14px 16px; margin-bottom:10px; box-shadow:var(--shadow-sm);';
+    // --- Activity log: who created or cancelled what, and when. Visible to everyone,
+    // specifically so that if a member cancels someone ELSE's request — which the
+    // Firestore rules technically permit, since loan requests are a single shared
+    // document — it doesn't happen invisibly. ---
+    if(state.loanRequestLog.length > 0){
+      const logHeading = document.createElement('p');
+      logHeading.style.cssText = 'font-size:11px; letter-spacing:.02em; color:var(--muted); margin:20px 0 8px; font-weight:600; text-transform:uppercase;';
+      logHeading.textContent = 'Activity log';
+      body.appendChild(logHeading);
 
-      const top = document.createElement('div');
-      top.style.cssText = 'display:flex; justify-content:space-between; align-items:baseline; gap:8px;';
-      top.innerHTML = `<span style="font-weight:700; color:var(--ink); font-size:14px;">${req.memberName}</span>
-        <span class="num" style="font-weight:800; color:var(--teal); font-size:15px;">${INR(req.amount)}</span>`;
-      reqCard.appendChild(top);
-
-      const metaP = document.createElement('p');
-      metaP.style.cssText = 'font-size:11.5px; color:var(--muted); margin:4px 0 0;';
-      metaP.textContent = `Requested ${monthLabel(req.requestedMonth)}${req.remark ? ' \u00B7 ' + req.remark : ''}`;
-      reqCard.appendChild(metaP);
-
-      const canCancel = window.isAdmin || (loggedInMember && loggedInMember.id === req.memberId);
-      if(canCancel){
-        const cancelBtn = document.createElement('button');
-        cancelBtn.className = 'ghost';
-        cancelBtn.style.cssText = 'margin-top:8px; color:var(--clay); padding:4px 8px; font-size:12px;';
-        cancelBtn.textContent = window.isAdmin ? 'Remove' : 'Cancel request';
-        cancelBtn.onclick = async ()=>{
-          state.loanRequests = state.loanRequests.filter(r=>r.id !== req.id);
-          await persistLoanRequests();
-          render();
-        };
-        reqCard.appendChild(cancelBtn);
-      }
-
-      body.appendChild(reqCard);
-    });
+      const sortedLog = [...state.loanRequestLog].sort((a,b)=> (b.timestamp||'').localeCompare(a.timestamp||''));
+      sortedLog.forEach(entry=>{
+        const row = document.createElement('div');
+        row.style.cssText = 'padding:8px 4px; border-bottom:1px solid var(--rule); font-size:12.5px; color:var(--ink);';
+        const when = entry.timestamp ? new Date(entry.timestamp).toLocaleString('en-IN', { day:'numeric', month:'short', year:'numeric', hour:'numeric', minute:'2-digit' }) : '';
+        const verb = entry.action === 'cancelled' ? 'cancelled' : 'requested';
+        row.innerHTML = `<span style="font-weight:600;">${entry.byName}</span> ${verb} <span class="num" style="font-weight:700;">${INR(entry.amount)}</span> for <span style="font-weight:600;">${entry.memberName}</span>
+          <br><span style="color:var(--muted); font-size:11px;">${when}</span>`;
+        body.appendChild(row);
+      });
+    }
   }
 
   function renderMembers(body){
